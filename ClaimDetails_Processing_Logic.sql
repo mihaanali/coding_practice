@@ -147,10 +147,31 @@ GO
 -- ============================================================================
 -- STEP 2: FINAL CLAIM STATE — One Row Per Claim-Line (Deduplicated)
 -- ============================================================================
--- When a claim is adjusted, there are multiple versions sharing the same
--- MasterClaimId. This query picks only the LATEST version of each claim-line.
+-- Two types of duplication exist and must be handled in order:
 --
--- IMPORTANT: The adjustment row replaces the original. Do NOT sum them.
+--   TYPE 1 — SNAPSHOT DUPLICATES: The same claim+line loaded in multiple
+--            Dataset batches as its status evolves (PEND→PAY→PAID).
+--            These have the SAME claimid+claimline but different Dataset values.
+--            Resolution: keep the row from the latest Dataset.
+--
+--   TYPE 2 — ADJUSTMENT CHAINS: A corrected claim replaces the original.
+--            These have DIFFERENT claimid values sharing the same MasterClaimId.
+--            Resolution: keep the adjustment, discard the original.
+--
+-- Both are handled in a single ROW_NUMBER. The PARTITION is by
+-- (MasterClaimId, claimline) which captures both cases.
+--
+-- WHY Dataset IS a tiebreaker in ORDER BY (and NOT in PARTITION BY):
+--   - Dataset in PARTITION BY would prevent deduplication (each batch becomes
+--     its own group). NEVER do this.
+--   - Dataset in ORDER BY (last position) safely resolves ties when timestamps
+--     are identical. The later batch (higher Dataset value) has the more
+--     current status.
+--   - Related claims (original + adjustment) have DIFFERENT claimid/claimline
+--     values, so they're in SEPARATE partitions. The ROW_NUMBER can never
+--     accidentally filter out a related claim from an earlier Dataset.
+--
+-- IMPORTANT: The adjustment row REPLACES the original. Do NOT sum them.
 
 CREATE VIEW vw_FinalClaimState AS
 WITH RankedClaims AS (
@@ -159,12 +180,16 @@ WITH RankedClaims AS (
         ROW_NUMBER() OVER (
             PARTITION BY MasterClaimId, claimline
             ORDER BY
-                -- Prefer the most recent version
+                -- Primary: prefer the most recent version by timestamps
                 ClaimDetailLastUpdate DESC,
                 ClaimLastUpdate DESC,
                 createdate DESC,
-                -- Prefer adjustments over originals
-                CASE WHEN MasterClaimId = claimid THEN 1 ELSE 0 END ASC
+                -- Secondary: prefer adjustments over originals
+                CASE WHEN MasterClaimId = claimid THEN 1 ELSE 0 END ASC,
+                -- Final tiebreaker: later Dataset batch wins when timestamps match.
+                -- Dataset format is DYYMMDD so lexicographic sort = chronological.
+                -- DO NOT move this to PARTITION BY — that would break deduplication.
+                Dataset DESC
         ) AS rn
     FROM [Prominence].[dbo].[ClaimDetails]
     WHERE ClaimStatus NOT IN ('VOID', 'REV')  -- exclude cancelled/reversed entirely
@@ -549,7 +574,9 @@ FROM (
         *,
         ROW_NUMBER() OVER (
             PARTITION BY MasterClaimId, claimline
-            ORDER BY ClaimDetailLastUpdate DESC, ClaimLastUpdate DESC, createdate DESC
+            ORDER BY ClaimDetailLastUpdate DESC, ClaimLastUpdate DESC, createdate DESC,
+                     CASE WHEN MasterClaimId = claimid THEN 1 ELSE 0 END ASC,
+                     Dataset DESC
         ) AS rn
     FROM [Prominence].[dbo].[ClaimDetails]
     WHERE (ClaimLevelOnly IS NULL OR ClaimLevelOnly = '' OR ClaimLevelOnly = '0')
@@ -609,7 +636,9 @@ WITH FinalClaims AS (
         *,
         ROW_NUMBER() OVER (
             PARTITION BY MasterClaimId, claimline
-            ORDER BY ClaimDetailLastUpdate DESC, ClaimLastUpdate DESC, createdate DESC
+            ORDER BY ClaimDetailLastUpdate DESC, ClaimLastUpdate DESC, createdate DESC,
+                     CASE WHEN MasterClaimId = claimid THEN 1 ELSE 0 END ASC,
+                     Dataset DESC
         ) AS rn
     FROM [Prominence].[dbo].[ClaimDetails]
     WHERE (ClaimLevelOnly IS NULL OR ClaimLevelOnly = '' OR ClaimLevelOnly = '0')
@@ -714,6 +743,12 @@ ORDER BY StatusCategory, Company, ServicePeriod;
         --> If MasterClaimId = claimid, it's the original.
         --> If MasterClaimId != claimid, it's an adjustment — USE THIS ONE, not the original.
         --> Never sum original + adjustment — the adjustment REPLACES the original.
+        --> The same claim+line may appear in multiple Dataset batches (snapshot duplicates).
+            The later Dataset has the more current status. Use Dataset as a final
+            tiebreaker in ROW_NUMBER ORDER BY, NEVER in PARTITION BY.
+        --> Related claims (original + adjustment) have DIFFERENT claimid and claimline
+            values, so they sit in separate ROW_NUMBER partitions. The deduplication
+            CANNOT accidentally filter out a related claim from an earlier Dataset.
 
     HEADER-ONLY ROWS (ClaimLevelOnly = 'Y'):
         --> Carry aggregated header amounts. Do NOT combine with detail rows.
